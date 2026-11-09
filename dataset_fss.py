@@ -8,7 +8,7 @@ Returns per item:
     query      : (3, H, W)  float
     query_mask : (1, H, W)  float {0,1}
     s_x        : (shot, 3, H, W)
-    s_y        : (shot, 1, H, W) {0,1}
+    s_y        : (shot, H, W) {0,1}
     class_id   : int (VOC class index)
 
 Paths passed in are expected to point directly at the image / mask folders.
@@ -212,7 +212,9 @@ class EpisodeDataset(Dataset):
         s_x = torch.stack([
             TF.normalize(TF.to_tensor(im), IMG_MEAN, IMG_STD) for im in s_imgs
         ])
-        s_y = torch.stack([(TF.to_tensor(m) > 0.5).float() for m in s_msks])
+        s_y = torch.stack(
+            [(TF.to_tensor(m) > 0.5).float().squeeze(0) for m in s_msks]
+        )  # (shot, H, W)
 
         return {
             "query": q_img,

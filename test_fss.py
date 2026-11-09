@@ -44,6 +44,8 @@ def parse_args():
     p.add_argument("--amp_dtype", type=str, default="auto",
                    choices=["auto", "bf16", "fp16", "none"])
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--cache_dir", type=str, default=None,
+                   help="cache of the per-class image index (optional)")
     p.add_argument("--save_png_dir", type=str, default=None,
                    help="if set, dump each query prediction as PNG")
     return p.parse_args()
@@ -71,6 +73,7 @@ def main(args):
         args.split, args.img_dir, args.mask_dir,
         classes=classes, shot=args.shot, size=args.size, mode="test",
         n_episodes=args.episodes, seed=args.seed,
+        cache_dir=args.cache_dir,
     )
     loader = DataLoader(ds, batch_size=1, shuffle=False,
                         num_workers=args.num_workers)
