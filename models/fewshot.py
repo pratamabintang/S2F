@@ -35,18 +35,19 @@ class Up(nn.Module):
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
 
-    def forward(self, x1, x2):
+    def forward(self, x1, *skips):
         x1 = self.up(x1)
         # input is CHW
-        diffY = x2.size()[2] - x1.size()[2]
-        diffX = x2.size()[3] - x1.size()[3]
+        ref = skips[0]
+        diffY = ref.size()[2] - x1.size()[2]
+        diffX = ref.size()[3] - x1.size()[3]
 
         x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
                         diffY // 2, diffY - diffY // 2])
         # if you have padding issues, see
         # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
         # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
-        x = torch.cat([x2, x1], dim=1)
+        x = torch.cat([x1, *skips], dim=1)
         return self.conv(x)
 
 
@@ -136,7 +137,7 @@ class ProtoFormer(nn.Module):
         super(ProtoFormer, self).__init__()
         self.shot = shot
         self.reduce_dim = reduce_dim
-        in_fea_dim = 1024 + 512
+        in_fea_dim = 288 + 576
         drop_out = 0.5
 
         self.adjust_feature_supp = nn.Sequential(
@@ -219,18 +220,17 @@ class ProtoFormer(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
 
-    def forward(self, x, s_x=None, s_y=None):
-        batch_size, C, h, w = x.size()
-        img_size = x.size()[-2:]
-
-        # TIDAK ADA BACKBONE DI SINI. PROTOFORMER MENERIMA FITUR DARI FEWSHOTSEG
-        qry_bcb_fts = self.backbone(x)
-        supp_bcb_fts = self.backbone(s_x.view(-1, 3, *img_size))
-        query_feat = torch.cat([qry_bcb_fts['1'], qry_bcb_fts['2']], dim=1)
-        supp_feat = torch.cat([supp_bcb_fts['1'], supp_bcb_fts['2']], dim=1)
+    def forward(self, q_feats, s_feats, s_y):
+        q2, q3, q4 = q_feats[1], q_feats[2], q_feats[3]
+        s2, s3, s4 = s_feats[1], s_feats[2], s_feats[3]
+        batch_size = q3.size(0)
+        fts_size = q3.shape[-2:]
+        q2_dn = F.interpolate(q2, size=fts_size, mode='bilinear', align_corners=True)
+        s2_dn = F.interpolate(s2, size=fts_size, mode='bilinear', align_corners=True)
+        query_feat = torch.cat([q2_dn, q3], dim=1)
+        supp_feat = torch.cat([s2_dn, s3], dim=1)
         query_feat = self.adjust_feature_qry(query_feat)
         supp_feat = self.adjust_feature_supp(supp_feat) 
-        fts_size = query_feat.shape[-2:]
         supp_feat_list = []
         r_supp_feat = supp_feat.view(batch_size, self.shot, -1, fts_size[0], fts_size[1])
         for st in range(self.shot):
@@ -251,10 +251,8 @@ class ProtoFormer(nn.Module):
         key_embed=query_feat
         masking=None
         fg_embed=self.transformer(key_embed,masking,query_embed,query_pos,key_pos)
-        # prior generation
-        query_feat_high = qry_bcb_fts['3']
-        supp_feat_high = supp_bcb_fts['3'].view(batch_size, -1, 2048, fts_size[0], fts_size[1])
-        corr_query_mask = self.generate_prior(query_feat_high, supp_feat_high, s_y, fts_size)
+        supp_feat_high = s4.view(batch_size, self.shot, s4.size(1), s4.size(2), s4.size(3))
+        corr_query_mask = self.generate_prior(q4, supp_feat_high, s_y, fts_size)
         
         pyramid_feat_list = []
         out_list = []
@@ -285,10 +283,7 @@ class ProtoFormer(nn.Module):
         query_feat = torch.cat(pyramid_feat_list, 1)
         query_feat = self.res1(query_feat)
         query_feat = self.res2(query_feat)   
-        fused_query_feat = query_feat.clone()                   
-        # Output Part
-        out1=torch.sigmoid(torch.einsum("bchw,bcl->blhw",fused_query_feat,fg_embed))
-        out = F.interpolate(out1, size=(h, w), mode='bilinear', align_corners=True) 
+        out = query_feat * torch.sigmoid(fg_embed)
         return out
 
     def generate_prior(self, query_feat_high, supp_feat_high, s_y, fts_size):
@@ -297,7 +292,7 @@ class ProtoFormer(nn.Module):
         cosine_eps = 1e-7
         for st in range(self.shot):
             tmp_mask = (s_y[:,st,:,:] == 1).float().unsqueeze(1)
-            tmp_mask = F.interpolate(tmp_mask, size=(fts_size[0], fts_size[1]), mode='bilinear', align_corners=True)
+            tmp_mask = F.interpolate(tmp_mask, size=(sp_sz, sp_sz), mode='bilinear', align_corners=True)
 
             tmp_supp_feat = supp_feat_high[:,st,...] * tmp_mask               
             q = self.high_avg_pool(query_feat_high.flatten(2).transpose(-2, -1))  # [bs, h*w, c]
@@ -325,7 +320,6 @@ class ProtoFormer(nn.Module):
 class FewShotSeg(nn.Module):
     def __init__(self, shot=1, reduce_dim=64, checkpoint_path=None) -> None:
         super(FewShotSeg, self).__init__()
-        self.prototype = ProtoFormer(shot=shot, reduce_dim=reduce_dim)
         model_cfg = "sam2_hiera_l.yaml"
         if checkpoint_path:
             model = build_sam2(model_cfg, checkpoint_path)
@@ -351,22 +345,32 @@ class FewShotSeg(nn.Module):
         self.encoder.blocks = nn.Sequential(
             *blocks
         )
+        self.prototype = ProtoFormer(shot=shot, reduce_dim=reduce_dim)
         self.rfb1 = RFB_modified(144, 64)
         self.rfb2 = RFB_modified(288, 64)
         self.rfb3 = RFB_modified(576, 64)
         self.rfb4 = RFB_modified(1152, 64)
-        self.up1 = (Up(128, 64))
+        self.up1 = (Up(64 * 3, 64))
         self.up2 = (Up(128, 64))
         self.up3 = (Up(128, 64))
-        self.up4 = (Up(128, 64))
         self.side1 = nn.Conv2d(64, 1, kernel_size=1)
         self.side2 = nn.Conv2d(64, 1, kernel_size=1)
         self.head = nn.Conv2d(64, 1, kernel_size=1)
-    
+
     def forward(self, x, s_x=None, s_y=None):
-        x1, x2, x3, x4 = self.encoder(x)
+        # x:   (B, 3, H, W) query images
+        # s_x: (B, shot, 3, H, W) support images
+        # s_y: (B, shot, H, W) support masks (1 = foreground)
+        img_size = x.size()[-2:]
+
+        q_feats = self.encoder(x)
+        s_feats = self.encoder(s_x.view(-1, 3, *img_size))
+
+        proto = self.prototype(q_feats, s_feats, s_y)
+
+        x1, x2, x3, x4 = q_feats
         x1, x2, x3, x4 = self.rfb1(x1), self.rfb2(x2), self.rfb3(x3), self.rfb4(x4)
-        x = self.up1(x4, x3)
+        x = self.up1(x4, x3, proto)
         out1 = F.interpolate(self.side1(x), scale_factor=16, mode='bilinear')
         x = self.up2(x, x2)
         out2 = F.interpolate(self.side2(x), scale_factor=8, mode='bilinear')
@@ -379,5 +383,7 @@ if __name__ == "__main__":
     with torch.no_grad():
         model = FewShotSeg().cuda()
         x = torch.randn(1, 3, 352, 352).cuda()
-        out, out1, out2 = model(x)
+        s_x = torch.randn(1, 1, 3, 352, 352).cuda()
+        s_y = torch.zeros(1, 1, 352, 352).cuda()
+        out, out1, out2 = model(x, s_x, s_y)
         print(out.shape, out1.shape, out2.shape)
