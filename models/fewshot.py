@@ -121,6 +121,14 @@ class RFB_modified(nn.Module):
         return x
 
 
+def Weighted_GAP(supp_feat, mask):
+    supp_feat = supp_feat * mask
+    feat_h, feat_w = supp_feat.shape[-2:][0], supp_feat.shape[-2:][1]
+    area = F.avg_pool2d(mask, (supp_feat.size()[2], supp_feat.size()[3])) * feat_h * feat_w + 0.0005
+    supp_feat = F.avg_pool2d(input=supp_feat, kernel_size=supp_feat.shape[-2:]) * feat_h * feat_w / area  
+    return supp_feat
+
+
 class FewShotSeg(nn.Module):
     def __init__(self, checkpoint_path=None) -> None:
         super(FewShotSeg, self).__init__()    
