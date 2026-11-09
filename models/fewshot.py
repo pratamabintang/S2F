@@ -283,9 +283,9 @@ class ProtoFormer(nn.Module):
         query_feat = torch.cat(pyramid_feat_list, 1)
         query_feat = self.res1(query_feat)
         query_feat = self.res2(query_feat)   
-        # fg_embed: (B, C, 1) from the transformer -> channel gate (B, C, 1, 1)
-        fg_gate = torch.sigmoid(fg_embed.unsqueeze(-1))
-        out = query_feat * fg_gate
+        # fg_embed: (B, C, L=1) -> pixel-wise similarity with the prototype
+        sim = torch.einsum("bchw,bcl->bhw", query_feat, fg_embed).unsqueeze(1)
+        out = query_feat * torch.sigmoid(sim)
         return out
 
     def generate_prior(self, query_feat_high, supp_feat_high, s_y, fts_size):

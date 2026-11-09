@@ -156,9 +156,6 @@ def main(args):
             scaler.step(optim)
             scaler.update()
             running += loss.item()
-            if i % 25 == 0:
-                print(f"[fold {args.fold}] epoch {epoch+1} it {i} "
-                      f"loss {loss.item():.4f}", flush=True)
         scheduler.step()
         avg = running / max(1, len(train_loader))
 
