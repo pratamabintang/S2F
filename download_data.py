@@ -21,8 +21,16 @@ import urllib.request
 
 
 VOC_URL = "http://host.robots.ox.ac.uk/pascal/VOC/voc2012/VOCtrainval_11-May-2012.tar"
-SBD_URL = "http://www.eecs.berkeley.edu/Research/Projects/CS/vision/grouping/semantic_contours/benchmark.tgz"
+# Berkeley blocks the default python-urllib UA; we send a browser UA (below).
+# Keep a couple of mirror candidates for SBD.
+SBD_URLS = [
+    "https://www2.eecs.berkeley.edu/Research/Projects/CS/vision/grouping/semantic_contours/benchmark.tgz",
+    "http://www.eecs.berkeley.edu/Research/Projects/CS/vision/grouping/semantic_contours/benchmark.tgz",
+]
 SAM2_URL = "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt"
+
+USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/122.0 Safari/537.36")
 
 
 def parse_args():
@@ -32,7 +40,8 @@ def parse_args():
     p.add_argument("--ckpt_path", type=str, default=None,
                    help="full path to save sam2_hiera_large.pt")
     p.add_argument("--voc_url", type=str, default=VOC_URL)
-    p.add_argument("--sbd_url", type=str, default=SBD_URL)
+    p.add_argument("--sbd_url", type=str, default=None,
+                   help="override SBD url (default: try built-in mirrors)")
     p.add_argument("--sam2_url", type=str, default=SAM2_URL)
     p.add_argument("--skip_voc", action="store_true")
     p.add_argument("--skip_sbd", action="store_true")
@@ -41,14 +50,23 @@ def parse_args():
     return p.parse_args()
 
 
-def _progress(count, block_size, total_size):
-    if total_size <= 0:
-        return
-    done = min(count * block_size, total_size)
-    pct = 100.0 * done / total_size
-    sys.stdout.write(f"\r    {pct:5.1f}%  {done/1e6:7.1f}/{total_size/1e6:.1f} MB")
-    sys.stdout.flush()
-    if done >= total_size:
+def _stream(url, dst):
+    """Download `url` to `dst` with a browser UA and a progress line."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=60) as r, open(dst, "wb") as f:
+        total = int(r.headers.get("Content-Length", 0) or 0)
+        done = 0
+        while True:
+            chunk = r.read(1 << 20)  # 1 MB
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if total > 0:
+                pct = 100.0 * done / total
+                sys.stdout.write(
+                    f"\r    {pct:5.1f}%  {done/1e6:7.1f}/{total/1e6:.1f} MB")
+                sys.stdout.flush()
         sys.stdout.write("\n")
 
 
@@ -59,9 +77,26 @@ def download(url, dst, overwrite=False):
     os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
     print(f"  downloading {url}\n    -> {dst}")
     tmp = dst + ".part"
-    urllib.request.urlretrieve(url, tmp, reporthook=_progress)
-    os.replace(tmp, dst)
+    try:
+        _stream(url, tmp)
+        os.replace(tmp, dst)
+    except Exception:
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+        raise
     return dst
+
+
+def download_any(urls, dst, overwrite=False):
+    """Try each url until one succeeds."""
+    last_err = None
+    for url in urls:
+        try:
+            return download(url, dst, overwrite)
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            print(f"  [fail] {url}: {e}")
+    raise RuntimeError(f"all mirrors failed for {dst}: {last_err}")
 
 
 def extract(archive, dest):
@@ -131,8 +166,10 @@ def main(args):
 
     if not args.skip_sbd:
         print("[SBD]")
-        archive = download(args.sbd_url, os.path.join(args.root, "benchmark.tgz"),
-                           args.overwrite)
+        sbd_urls = [args.sbd_url] if args.sbd_url else SBD_URLS
+        archive = download_any(sbd_urls,
+                               os.path.join(args.root, "benchmark.tgz"),
+                               args.overwrite)
         setup_sbd(args.root, archive, args.overwrite)
 
     if (not args.skip_ckpt) and args.ckpt_path:
