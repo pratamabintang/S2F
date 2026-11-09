@@ -42,12 +42,25 @@ def parse_args():
     p.add_argument("--reduce_dim", type=int, default=64)
     p.add_argument("--episodes", type=int, default=1000)
     p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--amp_dtype", type=str, default="bf16",
-                   choices=["bf16", "fp16", "none"])
+    p.add_argument("--amp_dtype", type=str, default="auto",
+                   choices=["auto", "bf16", "fp16", "none"])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--save_png_dir", type=str, default=None,
                    help="if set, dump each query prediction as PNG")
     return p.parse_args()
+
+
+def resolve_amp(mode, device):
+    """Pick a working autocast dtype for this GPU (bf16 needs Ampere+)."""
+    if mode == "none" or device.type != "cuda":
+        return None
+    cc_major = torch.cuda.get_device_capability()[0]
+    if mode == "auto":
+        mode = "bf16" if cc_major >= 8 else "fp16"
+    if mode == "bf16" and cc_major < 8:
+        print("[amp] GPU < Ampere -> bf16 fallback to fp16")
+        mode = "fp16"
+    return mode
 
 
 @torch.no_grad()
@@ -73,8 +86,9 @@ def main(args):
     if args.save_png_dir:
         os.makedirs(args.save_png_dir, exist_ok=True)
 
-    use_amp = (args.amp_dtype != "none") and device.type == "cuda"
-    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+    amp_mode = resolve_amp(args.amp_dtype, device)
+    use_amp = amp_mode is not None
+    amp_dtype = torch.bfloat16 if amp_mode == "bf16" else torch.float16
 
     metrics = FSSMetrics(classes)
     for i, batch in enumerate(loader):

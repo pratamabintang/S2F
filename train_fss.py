@@ -35,6 +35,20 @@ from eval_fss import evaluate
 from models.fewshot import FewShotSeg
 
 
+def resolve_amp(mode, device):
+    """Pick a working autocast dtype for this GPU (bf16 needs Ampere+)."""
+    if mode == "none" or device.type != "cuda":
+        return None
+    cc_major = torch.cuda.get_device_capability()[0]
+    if mode == "auto":
+        mode = "bf16" if cc_major >= 8 else "fp16"
+    if mode == "bf16" and cc_major < 8:
+        print("[amp] GPU < Ampere (sm_%d) -> bf16 fallback to fp16" % cc_major,
+              flush=True)
+        mode = "fp16"
+    return mode
+
+
 def structure_loss(pred, mask):
     weit = 1 + 5 * torch.abs(
         F.avg_pool2d(mask, kernel_size=31, stride=1, padding=15) - mask
@@ -72,9 +86,9 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=5e-4)
     p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--amp_dtype", type=str, default="bf16",
-                   choices=["bf16", "fp16", "none"],
-                   help="mixed precision: bf16 (Ampere+), fp16 (GradScaler), none")
+    p.add_argument("--amp_dtype", type=str, default="auto",
+                   choices=["auto", "bf16", "fp16", "none"],
+                   help="mixed precision: auto (bf16 on Ampere+, fp16 else), or forced")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--cache_dir", type=str, default=None,
                    help="cache of the per-class image index (optional)")
@@ -114,13 +128,12 @@ def main(args):
     scheduler = CosineAnnealingLR(optim, args.epochs, eta_min=1.0e-7)
     os.makedirs(args.save_path, exist_ok=True)
 
-    use_amp = (args.amp_dtype != "none") and device.type == "cuda"
-    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+    amp_mode = resolve_amp(args.amp_dtype, device)
+    use_amp = amp_mode is not None
+    amp_dtype = torch.bfloat16 if amp_mode == "bf16" else torch.float16
     # bf16 needs no gradient scaling; fp16 does
-    scaler = torch.amp.GradScaler(
-        "cuda", enabled=(use_amp and args.amp_dtype == "fp16")
-    )
-    print(f"AMP: {args.amp_dtype} (enabled={use_amp})", flush=True)
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp_mode == "fp16"))
+    print(f"AMP: {amp_mode or 'none'} (enabled={use_amp})", flush=True)
 
     best_miou = -1.0
     for epoch in range(args.epochs):
