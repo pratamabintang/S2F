@@ -1,15 +1,21 @@
 """First-time dataset download + extraction for PASCAL-5i few-shot.
 
-Downloads (if missing):
-  * PASCAL VOC2012 devkit  -> <root>/VOC2012/{JPEGImages,SegmentationClass}
-  * SBD benchmark.tgz      -> <root>/SBD/{img,cls}
-  * SAM2 Hiera-L ckpt      -> <ckpt_path>
+Archives are cached on persistent storage (`--archive_dir`, e.g. Google Drive);
+extraction happens on fast LOCAL disk (`--extract_root`, e.g. /content/datasets).
+This avoids writing thousands of small files to the Drive FUSE mount.
+
+Result:
+    <extract_root>/VOC2012/{JPEGImages,SegmentationClass}
+    <extract_root>/SBD/{img,cls}
+    <ckpt_path>  (sam2_hiera_large.pt)
 
 Usage:
-    python download_data.py --root /content/drive/MyDrive/datasets/PASCAL \
+    python download_data.py \
+        --archive_dir /content/drive/MyDrive/datasets/_archives \
+        --extract_root /content/datasets \
         --ckpt_path /content/drive/MyDrive/checkpoints/sam2_hiera_large.pt
 
-By default an existing folder/file is not re-downloaded. Use --overwrite to force.
+Existing folders/files are skipped; --overwrite forces re-download/extract.
 """
 
 import os
@@ -17,6 +23,7 @@ import sys
 import shutil
 import tarfile
 import argparse
+import subprocess
 import urllib.request
 
 
@@ -35,8 +42,10 @@ USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
 
 def parse_args():
     p = argparse.ArgumentParser("download PASCAL-5i assets")
-    p.add_argument("--root", type=str, required=True,
-                   help="dir that will contain VOC2012/ and SBD/")
+    p.add_argument("--archive_dir", type=str, required=True,
+                   help="persistent dir to cache the tar/tgz archives")
+    p.add_argument("--extract_root", type=str, required=True,
+                   help="fast local dir to extract into (VOC2012/, SBD/)")
     p.add_argument("--ckpt_path", type=str, default=None,
                    help="full path to save sam2_hiera_large.pt")
     p.add_argument("--voc_url", type=str, default=VOC_URL)
@@ -100,13 +109,17 @@ def download_any(urls, dst, overwrite=False):
 
 
 def extract(archive, dest):
+    """Extract archive into `dest` using the `tar` CLI when available."""
     os.makedirs(dest, exist_ok=True)
     print(f"  extracting {archive} -> {dest}")
-    with tarfile.open(archive) as tar:
-        try:
-            tar.extractall(dest, filter="data")
-        except TypeError:  # python < 3.12
-            tar.extractall(dest)
+    if shutil.which("tar"):
+        subprocess.run(["tar", "-xf", archive, "-C", dest], check=True)
+    else:
+        with tarfile.open(archive) as tar:
+            try:
+                tar.extractall(dest, filter="data")
+            except TypeError:  # python < 3.12
+                tar.extractall(dest)
 
 
 def _find_dir(base, marker):
@@ -116,12 +129,12 @@ def _find_dir(base, marker):
     return None
 
 
-def setup_voc(root, archive, overwrite=False):
-    target = os.path.join(root, "VOC2012")
+def setup_voc(extract_root, archive, overwrite=False):
+    target = os.path.join(extract_root, "VOC2012")
     if os.path.isdir(os.path.join(target, "JPEGImages")) and not overwrite:
         print(f"  [skip] VOC2012 ready: {target}")
         return
-    tmp = os.path.join(root, "_voc_tmp")
+    tmp = os.path.join(extract_root, "_voc_tmp")
     if os.path.isdir(tmp):
         shutil.rmtree(tmp)
     extract(archive, tmp)
@@ -135,13 +148,13 @@ def setup_voc(root, archive, overwrite=False):
     print(f"  VOC2012 ready: {target}")
 
 
-def setup_sbd(root, archive, overwrite=False):
-    target = os.path.join(root, "SBD")
+def setup_sbd(extract_root, archive, overwrite=False):
+    target = os.path.join(extract_root, "SBD")
     if (os.path.isdir(os.path.join(target, "img"))
             and os.path.isdir(os.path.join(target, "cls")) and not overwrite):
         print(f"  [skip] SBD ready: {target}")
         return
-    tmp = os.path.join(root, "_sbd_tmp")
+    tmp = os.path.join(extract_root, "_sbd_tmp")
     if os.path.isdir(tmp):
         shutil.rmtree(tmp)
     extract(archive, tmp)
@@ -156,27 +169,29 @@ def setup_sbd(root, archive, overwrite=False):
 
 
 def main(args):
-    os.makedirs(args.root, exist_ok=True)
+    os.makedirs(args.archive_dir, exist_ok=True)
+    os.makedirs(args.extract_root, exist_ok=True)
 
     if not args.skip_voc:
         print("[VOC2012]")
-        archive = download(args.voc_url, os.path.join(args.root, "VOCtrainval.tar"),
+        archive = download(args.voc_url,
+                           os.path.join(args.archive_dir, "VOCtrainval.tar"),
                            args.overwrite)
-        setup_voc(args.root, archive, args.overwrite)
+        setup_voc(args.extract_root, archive, args.overwrite)
 
     if not args.skip_sbd:
         print("[SBD]")
         sbd_urls = [args.sbd_url] if args.sbd_url else SBD_URLS
         archive = download_any(sbd_urls,
-                               os.path.join(args.root, "benchmark.tgz"),
+                               os.path.join(args.archive_dir, "benchmark.tgz"),
                                args.overwrite)
-        setup_sbd(args.root, archive, args.overwrite)
+        setup_sbd(args.extract_root, archive, args.overwrite)
 
     if (not args.skip_ckpt) and args.ckpt_path:
         print("[SAM2 checkpoint]")
         download(args.sam2_url, args.ckpt_path, args.overwrite)
 
-    print("\ndone.")
+    print("\ndone. extracted to:", args.extract_root)
 
 
 if __name__ == "__main__":
