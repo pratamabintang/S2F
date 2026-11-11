@@ -117,8 +117,15 @@ def main(args):
     def class_name(c):
         return VOC_CLASSES[c] if args.dataset == "pascal" else "landslide"
 
-    loader = DataLoader(ds, batch_size=1, shuffle=False,
-                        num_workers=args.num_workers)
+    loader_kwargs = dict(
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=args.num_workers > 0,
+    )
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
+
+    loader = DataLoader(ds, batch_size=1, shuffle=False, **loader_kwargs)
 
     model = FewShotSeg(shot=args.shot, reduce_dim=args.reduce_dim,
                        topo_in_chans=topo_in_chans)

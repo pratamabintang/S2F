@@ -78,6 +78,30 @@ DIR_CANDIDATES = {
     "LABEL": ["label", "LABEL", "mask", "MASK", "gt", "GT", "labels"],
 }
 
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
+_TOPO_EXTS = (".tif", ".tiff", ".png", ".jpg")
+
+
+def _index_dir(dir_path: str, exts) -> dict:
+    """Scan a directory ONCE and map stem -> path (extension priority = exts).
+
+    Avoids repeated os.path.exists()/stat calls (expensive on Google Drive).
+    """
+    found = {}
+    with os.scandir(dir_path) as it:
+        for entry in it:
+            if not entry.is_file():
+                continue
+            stem, ext = os.path.splitext(entry.name)
+            ext = ext.lower()
+            if ext not in exts:
+                continue
+            rank = exts.index(ext)
+            prev = found.get(stem)
+            if prev is None or rank < prev[0]:
+                found[stem] = (rank, entry.path)
+    return {stem: path for stem, (_, path) in found.items()}
+
 _TOPO_MODALITIES = ("DTM", "SLOPE", "ASPECT", "ASPECT_COS", "ASPECT_SIN", "HILLSHADE")
 
 
@@ -160,15 +184,17 @@ class LandslideEpisodeDataset(Dataset):
         self.label_dir = _resolve_modality_dir(self.split_dir, "LABEL")
         self.topo_dirs = {m: _resolve_modality_dir(self.split_dir, m) for m in self.topo_modalities}
 
+        # One directory scan per modality (no per-sample stat/exists).
+        self.img_files = _index_dir(self.img_dir, _IMAGE_EXTS)
+        self.label_files = _index_dir(self.label_dir, _TOPO_EXTS)
+        self.topo_files = {
+            m: _index_dir(self.topo_dirs[m], _TOPO_EXTS) for m in self.topo_modalities
+        }
+
         self.blacklist = _SUP.load_blacklist(blacklist_path)
 
-        all_names = sorted(
-            os.path.splitext(f)[0]
-            for f in os.listdir(self.img_dir)
-            if os.path.isfile(os.path.join(self.img_dir, f))
-        )
         samples, skipped = [], 0
-        for name in all_names:
+        for name in sorted(self.img_files):
             if name in self.blacklist:
                 skipped += 1
                 continue
@@ -204,20 +230,76 @@ class LandslideEpisodeDataset(Dataset):
             )
             if os.path.isfile(cache_file):
                 with open(cache_file, "rb") as f:
-                    return pickle.load(f)
+                    cached = pickle.load(f)
+                print(
+                    f"[{self.split.upper()}] index positif dari cache: "
+                    f"{len(cached)} tile ({cache_file})",
+                    flush=True,
+                )
+                return cached
 
-        positives = [n for n in self.samples if bool((self._load_label(n) > 0).any())]
+        print(
+            f"[{self.split.upper()}] scan {len(self.samples)} label untuk "
+            f"deteksi tile positif (paralel, sekali saja)...",
+            flush=True,
+        )
+        workers = int(os.environ.get("FSS_SCAN_WORKERS", "16"))
+        workers = max(1, min(workers, len(self.samples)))
+
+        def _is_positive(name: str) -> bool:
+            path = self.label_files.get(name)
+            if path is None:
+                return False
+            try:
+                arr = np.asarray(Image.open(path))
+            except Exception:
+                import cv2
+                arr = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+                if arr is None:
+                    return False
+            positive = bool(arr.any())
+            del arr
+            return positive
+
+        positives = []
+        if workers == 1:
+            for k, name in enumerate(self.samples, 1):
+                if _is_positive(name):
+                    positives.append(name)
+                if k % 500 == 0:
+                    print(f"  ... {k}/{len(self.samples)}", flush=True)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for k, (name, ok) in enumerate(
+                    zip(self.samples, pool.map(_is_positive, self.samples)), 1
+                ):
+                    if ok:
+                        positives.append(name)
+                    if k % 500 == 0:
+                        print(f"  ... {k}/{len(self.samples)}", flush=True)
+
+        print(
+            f"[{self.split.upper()}] selesai: {len(positives)}/{len(self.samples)} "
+            f"tile positif ({workers} thread)",
+            flush=True,
+        )
 
         if cache_file:
             with open(cache_file, "wb") as f:
                 pickle.dump(positives, f)
+            print(f"[{self.split.upper()}] index disimpan: {cache_file}", flush=True)
         return positives
 
     # --------------------------------------------------------- raster load
     def _load_modality(self, sample_name: str, modality: str) -> torch.Tensor:
         """Load + normalize one modality (mirrors supervised dataset.py)."""
         if modality == "IMAGE":
-            path = _resolve_file(self.img_dir, sample_name, "IMAGE")
+            path = self.img_files.get(sample_name)
+            if path is None:
+                raise FileNotFoundError(
+                    f"no file for sample '{sample_name}' in {self.img_dir}"
+                )
             try:
                 img = Image.open(path)
                 rgb_arr = np.array(img.convert("RGB"), dtype=np.uint8)
@@ -237,7 +319,12 @@ class LandslideEpisodeDataset(Dataset):
                 std=_SUP.LandslideDataset.IMAGENET_STD,
             )
 
-        path = _resolve_file(self.topo_dirs[modality], sample_name, modality)
+        path = self.topo_files[modality].get(sample_name)
+        if path is None:
+            raise FileNotFoundError(
+                f"no file for modality '{modality}' sample '{sample_name}' "
+                f"in {self.topo_dirs[modality]}"
+            )
         arr = None
         try:
             with Image.open(path) as img:
@@ -283,7 +370,11 @@ class LandslideEpisodeDataset(Dataset):
         return torch.from_numpy(np.ascontiguousarray(norm)).float().unsqueeze(0)
 
     def _load_label(self, sample_name: str) -> torch.Tensor:
-        path = _resolve_file(self.label_dir, sample_name, "LABEL")
+        path = self.label_files.get(sample_name)
+        if path is None:
+            raise FileNotFoundError(
+                f"no file for label sample '{sample_name}' in {self.label_dir}"
+            )
         try:
             arr = np.array(Image.open(path))
         except Exception:

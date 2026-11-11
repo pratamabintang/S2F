@@ -168,12 +168,19 @@ def main(args):
     train_ds, val_ds, classes, topo_in_chans = build_datasets(args)
     tag = "landslide" if args.dataset == "landslide" else f"fold{args.fold}"
 
+    loader_kwargs = dict(
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=args.num_workers > 0,
+    )
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
+
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, drop_last=True,
+        drop_last=True, **loader_kwargs,
     )
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False,
-                            num_workers=args.num_workers)
+    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, **loader_kwargs)
 
     model = FewShotSeg(shot=args.shot, reduce_dim=args.reduce_dim,
                        topo_in_chans=topo_in_chans,
