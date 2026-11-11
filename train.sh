@@ -65,6 +65,7 @@ RUN_NAME="${RUN_NAME:-}"
 SAVE_PATH="${SAVE_PATH:-}"
 FOLD="${FOLD:-0}"
 RUN_TEST="false"
+TEST_ONLY="false"
 TEST_CHECKPOINT="${TEST_CHECKPOINT:-}"
 
 # PASCAL paths
@@ -124,6 +125,7 @@ Output:
   --run-name NAME                nama run (default: auto)
   --save-path PATH               override folder checkpoint save
   --test                         jalankan test_fss.py setelah training
+  --test-only                    hanya evaluasi test (training dilewati)
   --test-checkpoint PATH         checkpoint untuk test (default: best)
 
 PASCAL:
@@ -215,6 +217,8 @@ while [[ $# -gt 0 ]]; do
             if [[ "$arg" == *=* ]]; then TEST_CHECKPOINT="${arg#*=}"; else TEST_CHECKPOINT="$2"; shift; fi ;;
         --test|--run-test)
             RUN_TEST="true" ;;
+        --test-only|--test_only)
+            RUN_TEST="true"; TEST_ONLY="true" ;;
         --train-img-dir|--train_img_dir|--train-img-dir=*|--train_img_dir=*)
             if [[ "$arg" == *=* ]]; then P_TRAIN_IMG_DIR="${arg#*=}"; else P_TRAIN_IMG_DIR="$2"; shift; fi ;;
         --train-mask-dir|--train_mask_dir|--train-mask-dir=*|--train_mask_dir=*)
@@ -363,15 +367,21 @@ fi
 if [[ ! -f "$HIERA_PATH" && "$HIERA_PATH" == /content/* && ! -d "$(dirname "$HIERA_PATH")" ]]; then
     HIERA_PATH="$REPO_DIR/checkpoints/sam2_hiera_large.pt"
 fi
-ensure_checkpoint "$HIERA_PATH" \
-    "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt" \
-    "SAM2 Hiera Large"
+if [[ "$TEST_ONLY" != "true" ]]; then
+    ensure_checkpoint "$HIERA_PATH" \
+        "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt" \
+        "SAM2 Hiera Large"
+fi
 
 # -----------------------------------------------------------------------------
 # Nama run & folder output
 # -----------------------------------------------------------------------------
 if [[ -z "$RUN_NAME" ]]; then
-    RUN_NAME="s2f_${DATASET}_${TOPO_SLUG}_shot${SHOT}"
+    if [[ "$DATASET" == "pascal" ]]; then
+        RUN_NAME="s2f_pascal_fold${FOLD}_shot${SHOT}"
+    else
+        RUN_NAME="s2f_${DATASET}_${TOPO_SLUG}_shot${SHOT}"
+    fi
 fi
 if [[ -z "$SAVE_PATH" ]]; then
     SAVE_PATH="$OUTPUT_DIR/$RUN_NAME"
@@ -442,8 +452,12 @@ echo "==========================================================================
 echo ">> ${CMD[*]}"
 echo "-----------------------------------------------------------------------------"
 
-cd "$REPO_DIR"
-"${CMD[@]}"
+if [[ "$TEST_ONLY" == "true" ]]; then
+    echo ">> Mode --test-only: training dilewati."
+else
+    cd "$REPO_DIR"
+    "${CMD[@]}"
+fi
 
 # -----------------------------------------------------------------------------
 # Evaluasi test opsional
