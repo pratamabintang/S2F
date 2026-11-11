@@ -198,8 +198,8 @@ class FewShotSeg(nn.Module):
         self.fuse4 = SkipFusion(1152 + topo_channels[3], 64)
 
         self.up1 = (Up(64 * 3, 64))
-        self.up2 = (Up(128, 64))
-        self.up3 = (Up(128, 64))
+        self.up2 = (Up(64 * 3, 64))
+        self.up3 = (Up(64 * 3, 64))
         self.side1 = nn.Conv2d(64, 1, kernel_size=1)
         self.side2 = nn.Conv2d(64, 1, kernel_size=1)
         self.head = nn.Conv2d(64, 1, kernel_size=1)
@@ -252,9 +252,9 @@ class FewShotSeg(nn.Module):
 
         x = self.up1(x4, x3, proto)
         out1 = F.interpolate(self.side1(x), scale_factor=16, mode='bilinear')
-        x = self.up2(x, x2)
+        x = self.up2(x, x2, proto)
         out2 = F.interpolate(self.side2(x), scale_factor=8, mode='bilinear')
-        x = self.up3(x, x1)
+        x = self.up3(x, x1, proto)
         out = F.interpolate(self.head(x), scale_factor=4, mode='bilinear')
         return out, out1, out2
 
