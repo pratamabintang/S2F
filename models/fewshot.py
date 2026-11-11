@@ -250,11 +250,18 @@ class FewShotSeg(nn.Module):
         x1, x2, x3, x4 = q_feats_fuse
         # x1, x2, x3, x4 = self.rfb1(x1), self.rfb2(x2), self.rfb3(x3), self.rfb4(x4)
 
-        x = self.up1(x4, x3, proto)
+        # ProtoFormer works at level-3 resolution (H/16); resize per skip level.
+        def proto_at(ref):
+            if proto.shape[-2:] == ref.shape[-2:]:
+                return proto
+            return F.interpolate(proto, size=ref.shape[-2:], mode="bilinear",
+                                 align_corners=True)
+
+        x = self.up1(x4, x3, proto_at(x3))
         out1 = F.interpolate(self.side1(x), scale_factor=16, mode='bilinear')
-        x = self.up2(x, x2, proto)
+        x = self.up2(x, x2, proto_at(x2))
         out2 = F.interpolate(self.side2(x), scale_factor=8, mode='bilinear')
-        x = self.up3(x, x1, proto)
+        x = self.up3(x, x1, proto_at(x1))
         out = F.interpolate(self.head(x), scale_factor=4, mode='bilinear')
         return out, out1, out2
 
