@@ -21,7 +21,7 @@ import argparse
 import numpy as np
 from PIL import Image
 
-from dataset_fss import FOLD_CLASSES, VOC_CLASSES
+from loaders.pascal_fss import FOLD_CLASSES, VOC_CLASSES
 
 
 def parse_args():

@@ -14,6 +14,15 @@ python train_fss.py \
   --val_split /data/splits/pascal/fold0/val.txt \
   --save_path runs/fold0 \
   --shot 1 --size 352
+
+Landslide (multi-modal, RGB + topography):
+python train_fss.py \
+  --dataset landslide \
+  --hiera_path /path/sam2_hiera_large.pt \
+  --data_dir datasets/landslide \
+  --topo DTM HILLSHADE \
+  --save_path runs/landslide \
+  --shot 1 --size 352
 """
 
 import os
@@ -29,8 +38,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from dataset_fss import EpisodeDataset, fold_class_ids
-from eval_fss import evaluate
+from loaders.pascal_fss import EpisodeDataset, fold_class_ids
+from loaders.landslide_fss import LandslideEpisodeDataset
+from eval_fss import evaluate, unpack_batch
 from models.fewshot import FewShotSeg
 
 
@@ -63,14 +73,30 @@ def structure_loss(pred, mask):
 
 def parse_args():
     p = argparse.ArgumentParser("S2F few-shot")
-    p.add_argument("--fold", type=int, required=True, choices=[0, 1, 2, 3])
+    p.add_argument("--dataset", type=str, default="pascal",
+                   choices=["pascal", "landslide"],
+                   help="episodic dataset: PASCAL-5i or multi-modal landslide")
+    p.add_argument("--fold", type=int, default=0, choices=[0, 1, 2, 3],
+                   help="PASCAL fold (ignored for landslide)")
     p.add_argument("--hiera_path", type=str, required=True)
-    p.add_argument("--train_img_dir", type=str, required=True)
-    p.add_argument("--train_mask_dir", type=str, required=True)
-    p.add_argument("--train_split", type=str, required=True)
-    p.add_argument("--val_img_dir", type=str, required=True)
-    p.add_argument("--val_mask_dir", type=str, required=True)
-    p.add_argument("--val_split", type=str, required=True)
+    # PASCAL paths
+    p.add_argument("--train_img_dir", type=str, default=None)
+    p.add_argument("--train_mask_dir", type=str, default=None)
+    p.add_argument("--train_split", type=str, default=None)
+    p.add_argument("--val_img_dir", type=str, default=None)
+    p.add_argument("--val_mask_dir", type=str, default=None)
+    p.add_argument("--val_split", type=str, default=None)
+    # Landslide paths
+    p.add_argument("--data_dir", type=str, default="datasets/landslide")
+    p.add_argument("--train_dir", type=str, default=None,
+                   help="override train split dir (default: <data_dir>/train)")
+    p.add_argument("--val_dir", type=str, default=None,
+                   help="override val split dir (default: <data_dir>/val)")
+    p.add_argument("--topo", nargs="+", default=["DTM"],
+                   help="topo modalities, e.g. --topo DTM HILLSHADE")
+    p.add_argument("--blacklist", type=str,
+                   default="datasets/landslide/black_list.txt",
+                   help="set to 'none' to disable the blacklist")
     p.add_argument("--save_path", type=str, required=True)
     p.add_argument("--shot", type=int, default=1)
     p.add_argument("--size", type=int, default=352)
@@ -94,11 +120,33 @@ def parse_args():
     return p.parse_args()
 
 
-def main(args):
-    torch.manual_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    classes = fold_class_ids(args.fold)
+def build_datasets(args):
+    """Build (train_ds, val_ds, classes, topo_in_chans) for the chosen dataset."""
+    bl = None if (args.blacklist and args.blacklist.lower() == "none") else args.blacklist
 
+    if args.dataset == "landslide":
+        classes = [1]
+        train_data_dir = args.train_dir or args.data_dir
+        val_data_dir = args.val_dir or args.data_dir
+        train_ds = LandslideEpisodeDataset(
+            data_dir=train_data_dir, split="train", size=args.size, shot=args.shot,
+            topo_modalities=args.topo, n_episodes=args.episodes_per_epoch,
+            mode="train", blacklist_path=bl, cache_dir=args.cache_dir,
+            seed=args.seed,
+        )
+        val_ds = LandslideEpisodeDataset(
+            data_dir=val_data_dir, split="val", size=args.size, shot=args.shot,
+            topo_modalities=args.topo, n_episodes=args.val_episodes,
+            mode="val", blacklist_path=bl, cache_dir=args.cache_dir,
+            seed=args.seed + 12345,
+        )
+        return train_ds, val_ds, classes, len(args.topo)
+
+    for name in ("train_img_dir", "train_mask_dir", "train_split",
+                 "val_img_dir", "val_mask_dir", "val_split"):
+        if getattr(args, name) is None:
+            raise ValueError(f"--{name} is required for --dataset pascal")
+    classes = fold_class_ids(args.fold)
     train_ds = EpisodeDataset(
         args.train_split, args.train_img_dir, args.train_mask_dir,
         classes=classes, shot=args.shot, size=args.size, mode="train",
@@ -111,6 +159,15 @@ def main(args):
         n_episodes=args.val_episodes, cache_dir=args.cache_dir,
         seed=args.seed + 12345,
     )
+    return train_ds, val_ds, classes, 1
+
+
+def main(args):
+    torch.manual_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_ds, val_ds, classes, topo_in_chans = build_datasets(args)
+    tag = "landslide" if args.dataset == "landslide" else f"fold{args.fold}"
+
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, drop_last=True,
@@ -119,6 +176,7 @@ def main(args):
                             num_workers=args.num_workers)
 
     model = FewShotSeg(shot=args.shot, reduce_dim=args.reduce_dim,
+                       topo_in_chans=topo_in_chans,
                        checkpoint_path=args.hiera_path)
     model.to(device)
 
@@ -140,15 +198,20 @@ def main(args):
         train_ds.set_epoch(epoch)
         running = 0.0
         for i, batch in enumerate(train_loader):
-            q = batch["query"].to(device)
-            target = batch["query_mask"].to(device)
-            s_x = batch["s_x"].to(device)
-            s_y = batch["s_y"].to(device)
+            q_rgb, q_topo, target, s_x_rgb, s_x_topo, s_y = unpack_batch(batch)
+            q_rgb = q_rgb.to(device)
+            target = target.to(device)
+            s_x_rgb = s_x_rgb.to(device)
+            s_y = s_y.to(device)
+            if q_topo is not None:
+                q_topo = q_topo.to(device)
+            if s_x_topo is not None:
+                s_x_topo = s_x_topo.to(device)
 
             optim.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=amp_dtype,
                                 enabled=use_amp):
-                out, out1, out2 = model(q, s_x, s_y)
+                out, out1, out2 = model(q_rgb, q_topo, s_x_rgb, s_x_topo, s_y)
                 loss = (structure_loss(out, target)
                         + structure_loss(out1, target)
                         + structure_loss(out2, target))
@@ -161,23 +224,23 @@ def main(args):
 
         if (epoch + 1) % args.val_interval == 0:
             metrics = evaluate(model, val_loader, device)
-            print(f"[fold {args.fold}] epoch {epoch+1} train_loss {avg:.4f} "
+            print(f"[{tag}] epoch {epoch+1} train_loss {avg:.4f} "
                   f"mIoU {metrics['mIoU']:.4f} FB-IoU {metrics['FB-IoU']:.4f}",
                   flush=True)
-            ckpt = os.path.join(args.save_path, f"S2F-fold{args.fold}-last.pth")
+            ckpt = os.path.join(args.save_path, f"S2F-{tag}-last.pth")
             torch.save(model.state_dict(), ckpt)
             if metrics["mIoU"] > best_miou:
                 best_miou = metrics["mIoU"]
                 torch.save(model.state_dict(),
                            os.path.join(args.save_path,
-                                        f"S2F-fold{args.fold}-best.pth"))
-                print(f"[fold {args.fold}] new best mIoU {best_miou:.4f}",
+                                        f"S2F-{tag}-best.pth"))
+                print(f"[{tag}] new best mIoU {best_miou:.4f}",
                       flush=True)
         else:
-            print(f"[fold {args.fold}] epoch {epoch+1} train_loss {avg:.4f}",
+            print(f"[{tag}] epoch {epoch+1} train_loss {avg:.4f}",
                   flush=True)
 
-    print(f"[fold {args.fold}] done. best mIoU {best_miou:.4f}")
+    print(f"[{tag}] done. best mIoU {best_miou:.4f}")
 
 
 if __name__ == "__main__":

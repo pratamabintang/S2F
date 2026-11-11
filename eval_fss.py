@@ -13,7 +13,25 @@ Protocol (PASCAL-5i):
 import numpy as np
 import torch
 
-from dataset_fss import fold_class_ids
+from loaders.pascal_fss import fold_class_ids
+
+
+def unpack_batch(batch):
+    """Split a PASCAL or landslide batch dict into model inputs.
+
+    Returns (q_rgb, q_topo, q_mask, s_x_rgb, s_x_topo, s_y).
+    Topography keys are absent for PASCAL (rgb-only) -> returned as None.
+    """
+    q_rgb = batch["query_rgb"] if "query_rgb" in batch else batch["query"]
+    s_x_rgb = batch["s_x_rgb"] if "s_x_rgb" in batch else batch["s_x"]
+    return (
+        q_rgb,
+        batch.get("query_topo"),
+        batch["query_mask"],
+        s_x_rgb,
+        batch.get("s_x_topo"),
+        batch["s_y"],
+    )
 
 
 class FSSMetrics:
@@ -61,13 +79,18 @@ def evaluate(model, loader, device, threshold=0.5):
     model.eval()
     metrics = FSSMetrics(_class_ids_from_loader(loader))
     for batch in loader:
-        q = batch["query"].to(device)
-        gt = batch["query_mask"].to(device)
-        s_x = batch["s_x"].to(device)
-        s_y = batch["s_y"].to(device)
+        q_rgb, q_topo, gt, s_x_rgb, s_x_topo, s_y = unpack_batch(batch)
+        q_rgb = q_rgb.to(device)
+        gt = gt.to(device)
+        s_x_rgb = s_x_rgb.to(device)
+        s_y = s_y.to(device)
+        if q_topo is not None:
+            q_topo = q_topo.to(device)
+        if s_x_topo is not None:
+            s_x_topo = s_x_topo.to(device)
         cls = int(batch["class_id"][0])
 
-        out = model(q, s_x, s_y)
+        out = model(q_rgb, q_topo, s_x_rgb, s_x_topo, s_y)
         if isinstance(out, (tuple, list)):
             out = out[0]
         if out.shape[-2:] != gt.shape[-2:]:

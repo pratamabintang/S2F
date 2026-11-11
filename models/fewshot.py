@@ -2,9 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from models.sam2.build_sam import build_sam2
-from .transformer import PositionEmbeddingSine
-from .transformer import Transformer
-
+from .protoformer import ProtoFormer
+import timm
 
 class DoubleConv(nn.Module):
     """(convolution => [BN] => ReLU) * 2"""
@@ -124,204 +123,34 @@ class RFB_modified(nn.Module):
         return x
 
 
-def Weighted_GAP(supp_feat, mask):
-    supp_feat = supp_feat * mask
-    feat_h, feat_w = supp_feat.shape[-2:][0], supp_feat.shape[-2:][1]
-    area = F.avg_pool2d(mask, (supp_feat.size()[2], supp_feat.size()[3])) * feat_h * feat_w + 0.0005
-    supp_feat = F.avg_pool2d(input=supp_feat, kernel_size=supp_feat.shape[-2:]) * feat_h * feat_w / area  
-    return supp_feat
+class SkipFusion(nn.Module):
+    def __init__(self, c_in: int, c_out: int):
+        super().__init__()
 
-
-class ProtoFormer(nn.Module):
-    def __init__(self, shot=1, reduce_dim=64):
-        super(ProtoFormer, self).__init__()
-        self.shot = shot
-        self.reduce_dim = reduce_dim
-        in_fea_dim = 288 + 576
-        drop_out = 0.5
-
-        self.adjust_feature_supp = nn.Sequential(
-            nn.Conv2d(in_fea_dim, reduce_dim, kernel_size=1, padding=0, bias=False),
-            nn.BatchNorm2d(reduce_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(p=drop_out),
-        ) 
-        self.adjust_feature_qry = nn.Sequential(
-            nn.Conv2d(in_fea_dim, reduce_dim, kernel_size=1, padding=0, bias=False),
-            nn.BatchNorm2d(reduce_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(p=drop_out),
-        )
-        self.query_embed=nn.Embedding(reduce_dim,1) 
-        self.pe_layer=PositionEmbeddingSine(reduce_dim//2, normalize=True)
-        self.transformer = Transformer(
-            d_model=reduce_dim,
-            dropout=0.1,
-            nhead=4,
-            dim_feedforward=reduce_dim//4,
-            num_encoder_layers=0,
-            num_decoder_layers=1,
-            normalize_before=False,
-            return_intermediate_dec=False,
-        )
-
-        self.high_avg_pool = nn.Identity()        
-        prior_channel = 1 
-        self.pyramid_bins = [60, 30, 15, 8]
-        self.avgpool_list = []
-        for bin in self.pyramid_bins:
-            if bin > 1:
-                self.avgpool_list.append(
-                    nn.AdaptiveAvgPool2d(bin)
-                )
-        self.init_merge = []
-        self.beta_conv = []        
-        for bin in self.pyramid_bins:
-            self.init_merge.append(nn.Sequential(
-                nn.Conv2d(reduce_dim*2+prior_channel, reduce_dim, kernel_size=1, padding=0, bias=False),
-                nn.BatchNorm2d(reduce_dim),
-                nn.ReLU(inplace=True)
-            ))                      
-            self.beta_conv.append(nn.Sequential(
-                nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(reduce_dim),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
-                nn.BatchNorm2d(reduce_dim),
-                nn.ReLU(inplace=True)
-            ))            
-
-        self.init_merge = nn.ModuleList(self.init_merge) 
-        self.beta_conv = nn.ModuleList(self.beta_conv)
-        self.res1 = nn.Sequential(
-            nn.Conv2d(reduce_dim*len(self.pyramid_bins), reduce_dim, kernel_size=1, padding=0, bias=False)                         
-        )              
-        self.res2 = nn.Sequential(
-            nn.Conv2d(reduce_dim, reduce_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(reduce_dim),
+        self.fusion = nn.Sequential(
+            nn.Conv2d(c_in, c_out, kernel_size=1, bias=False),
+            nn.BatchNorm2d(c_out),
             nn.ReLU(inplace=True)
         )
-        self.alpha_conv = []
-        for idx in range(len(self.pyramid_bins)-1):
-            self.alpha_conv.append(nn.Sequential(
-                nn.Conv2d(2*reduce_dim, reduce_dim, kernel_size=1, stride=1, padding=0, bias=False),
-                nn.BatchNorm2d(reduce_dim),
-                nn.ReLU()
-            ))     
-        self.alpha_conv = nn.ModuleList(self.alpha_conv)    
 
-        self.init_weights()
-
-    def init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if hasattr(m, 'bias') and m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-
-    def forward(self, q_feats, s_feats, s_y):
-        q2, q3, q4 = q_feats[1], q_feats[2], q_feats[3]
-        s2, s3, s4 = s_feats[1], s_feats[2], s_feats[3]
-        batch_size = q3.size(0)
-        fts_size = q3.shape[-2:]
-        q2_dn = F.interpolate(q2, size=fts_size, mode='bilinear', align_corners=True)
-        s2_dn = F.interpolate(s2, size=fts_size, mode='bilinear', align_corners=True)
-        query_feat = torch.cat([q2_dn, q3], dim=1)
-        supp_feat = torch.cat([s2_dn, s3], dim=1)
-        query_feat = self.adjust_feature_qry(query_feat)
-        supp_feat = self.adjust_feature_supp(supp_feat) 
-        supp_feat_list = []
-        r_supp_feat = supp_feat.view(batch_size, self.shot, -1, fts_size[0], fts_size[1])
-        for st in range(self.shot):
-            mask = (s_y[:,st,:,:]==1).float().unsqueeze(1)
-            mask = F.interpolate(mask, size=(fts_size[0], fts_size[1]), mode='bilinear', align_corners=True)
-            tmp_supp_feat = r_supp_feat[:,st,...]
-            tmp_supp_feat = Weighted_GAP(tmp_supp_feat, mask)
-            supp_feat_list.append(tmp_supp_feat)
-        global_supp_pp = supp_feat_list[0]
-        if self.shot > 1:
-            for i in range(1, len(supp_feat_list)):
-                global_supp_pp += supp_feat_list[i]
-            global_supp_pp /= len(supp_feat_list)
-                        
-        query_embed = global_supp_pp.squeeze(-1)
-        query_pos = self.query_embed.weight
-        key_pos=self.pe_layer(query_feat)
-        key_embed=query_feat
-        masking=None
-        fg_embed=self.transformer(key_embed,masking,query_embed,query_pos,key_pos)
-        supp_feat_high = s4.view(batch_size, self.shot, s4.size(1), s4.size(2), s4.size(3))
-        corr_query_mask = self.generate_prior(q4, supp_feat_high, s_y, fts_size)
-        
-        pyramid_feat_list = []
-        out_list = []
-        for idx, tmp_bin in enumerate(self.pyramid_bins):
-            if tmp_bin <= 1.0:
-                bin = int(query_feat.shape[2] * tmp_bin)
-                query_feat_bin = nn.AdaptiveAvgPool2d(bin)(query_feat)
-            else:
-                bin = tmp_bin
-                query_feat_bin = self.avgpool_list[idx](query_feat)
-            supp_feat_bin = global_supp_pp.expand(-1, -1, bin, bin)
-            corr_mask_bin = F.interpolate(corr_query_mask, size=(bin, bin), mode='bilinear', align_corners=True)
-            merge_feat_bin = torch.cat([query_feat_bin, supp_feat_bin, corr_mask_bin], 1)
-            merge_feat_bin = self.init_merge[idx](merge_feat_bin)
-
-            if idx >= 1:
-                pre_feat_bin = pyramid_feat_list[idx-1].clone()
-                pre_feat_bin = F.interpolate(pre_feat_bin, size=(bin, bin), mode='bilinear', align_corners=True)
-                rec_feat_bin = torch.cat([merge_feat_bin, pre_feat_bin], 1)
-                merge_feat_bin = self.alpha_conv[idx-1](rec_feat_bin) + merge_feat_bin
-
-            merge_feat_bin = self.beta_conv[idx](merge_feat_bin) + merge_feat_bin
-            inner_out_bin = merge_feat_bin
-            merge_feat_bin = F.interpolate(merge_feat_bin, size=(query_feat.size(2), query_feat.size(3)), mode='bilinear', align_corners=True)
-            pyramid_feat_list.append(merge_feat_bin)
-            out_list.append(inner_out_bin)
-                 
-        query_feat = torch.cat(pyramid_feat_list, 1)
-        query_feat = self.res1(query_feat)
-        query_feat = self.res2(query_feat)   
-        # fg_embed: (B, C, L=1) -> pixel-wise similarity with the prototype
-        sim = torch.einsum("bchw,bcl->bhw", query_feat, fg_embed).unsqueeze(1)
-        out = query_feat * torch.sigmoid(sim)
-        return out
-
-    def generate_prior(self, query_feat_high, supp_feat_high, s_y, fts_size):
-        bsize, _, sp_sz, _ = query_feat_high.size()[:]
-        corr_query_mask_list = []
-        cosine_eps = 1e-7
-        for st in range(self.shot):
-            tmp_mask = (s_y[:,st,:,:] == 1).float().unsqueeze(1)
-            tmp_mask = F.interpolate(tmp_mask, size=(sp_sz, sp_sz), mode='bilinear', align_corners=True)
-
-            tmp_supp_feat = supp_feat_high[:,st,...] * tmp_mask               
-            q = self.high_avg_pool(query_feat_high.flatten(2).transpose(-2, -1))  # [bs, h*w, c]
-            s = self.high_avg_pool(tmp_supp_feat.flatten(2).transpose(-2, -1))  # [bs, h*w, c]
-
-            tmp_query = q
-            tmp_query = tmp_query.contiguous().permute(0, 2, 1)  # [bs, c, h*w]
-            tmp_query_norm = torch.norm(tmp_query, 2, 1, True)
-
-            tmp_supp = s               
-            tmp_supp = tmp_supp.contiguous() 
-            tmp_supp = tmp_supp.contiguous() 
-            tmp_supp_norm = torch.norm(tmp_supp, 2, 2, True) 
-
-            similarity = torch.bmm(tmp_supp, tmp_query)/(torch.bmm(tmp_supp_norm, tmp_query_norm) + cosine_eps)   
-            similarity = similarity.max(1)[0].view(bsize, sp_sz*sp_sz)   
-            similarity = (similarity - similarity.min(1)[0].unsqueeze(1))/(similarity.max(1)[0].unsqueeze(1) - similarity.min(1)[0].unsqueeze(1) + cosine_eps)
-            corr_query = similarity.view(bsize, 1, sp_sz, sp_sz)
-            corr_query = F.interpolate(corr_query, size=(fts_size[0], fts_size[1]), mode='bilinear', align_corners=True)
-            corr_query_mask_list.append(corr_query)  
-        corr_query_mask = torch.cat(corr_query_mask_list, 1).mean(1).unsqueeze(1)     
-        return corr_query_mask
+    def forward(self, rgb, topo):
+        x = torch.cat([rgb, topo], dim=1)
+        return self.fusion(x)
 
 
 class FewShotSeg(nn.Module):
-    def __init__(self, shot=1, reduce_dim=64, checkpoint_path=None) -> None:
+    def __init__(
+        self,
+        topo_in_chans: int = 1,
+        topo_backbone: str = "convnext_tiny",
+        pretrained_topo: bool = True,
+        shot=1,
+        reduce_dim=64,
+        checkpoint_path=None
+    ) -> None:
         super(FewShotSeg, self).__init__()
+        self.topo_in_chans = topo_in_chans
+        self.topo_backbone_name = topo_backbone
         model_cfg = "sam2_hiera_l.yaml"
         if checkpoint_path:
             model = build_sam2(model_cfg, checkpoint_path)
@@ -347,11 +176,27 @@ class FewShotSeg(nn.Module):
         self.encoder.blocks = nn.Sequential(
             *blocks
         )
+
+        self.topo_encoder = timm.create_model(
+            topo_backbone,
+            pretrained=pretrained_topo,
+            in_chans=topo_in_chans,
+            features_only=True,
+        )
+        topo_channels = self.topo_encoder.feature_info.channels()
+        self.topo_channels = list(topo_channels)
+
         self.prototype = ProtoFormer(shot=shot, reduce_dim=reduce_dim)
-        self.rfb1 = RFB_modified(144, 64)
-        self.rfb2 = RFB_modified(288, 64)
-        self.rfb3 = RFB_modified(576, 64)
-        self.rfb4 = RFB_modified(1152, 64)
+        # self.rfb1 = RFB_modified(144, 64)
+        # self.rfb2 = RFB_modified(288, 64)
+        # self.rfb3 = RFB_modified(576, 64)
+        # self.rfb4 = RFB_modified(1152, 64)
+
+        self.fuse1 = SkipFusion(144 + topo_channels[0], 64)
+        self.fuse2 = SkipFusion(288 + topo_channels[1], 64)
+        self.fuse3 = SkipFusion(576 + topo_channels[2], 64)
+        self.fuse4 = SkipFusion(1152 + topo_channels[3], 64)
+
         self.up1 = (Up(64 * 3, 64))
         self.up2 = (Up(128, 64))
         self.up3 = (Up(128, 64))
@@ -359,19 +204,52 @@ class FewShotSeg(nn.Module):
         self.side2 = nn.Conv2d(64, 1, kernel_size=1)
         self.head = nn.Conv2d(64, 1, kernel_size=1)
 
-    def forward(self, x, s_x=None, s_y=None):
-        # x:   (B, 3, H, W) query images
-        # s_x: (B, shot, 3, H, W) support images
-        # s_y: (B, shot, H, W) support masks (1 = foreground)
-        img_size = x.size()[-2:]
+    def _zero_topo(self, rgb_feats):
+        """Zero topographic features (rgb-only mode, e.g. PASCAL-5i)."""
+        return [
+            torch.zeros(f.size(0), c, f.size(2), f.size(3),
+                        dtype=f.dtype, device=f.device)
+            for f, c in zip(rgb_feats, self.topo_channels)
+        ]
 
-        q_feats = self.encoder(x)
-        s_feats = self.encoder(s_x.view(-1, 3, *img_size))
+    def forward(self, x_rgb, x_topo=None, s_x_rgb=None, s_x_topo=None, s_y=None):
+        img_size = x_rgb.size()[-2:]
 
-        proto = self.prototype(q_feats, s_feats, s_y)
+        q_feats_rgb = self.encoder(x_rgb)
+        s_feats_rgb = self.encoder(s_x_rgb.view(-1, 3, *img_size))
+        qr1, qr2, qr3, qr4 = q_feats_rgb
+        sr1, sr2, sr3, sr4 = s_feats_rgb
 
-        x1, x2, x3, x4 = q_feats
-        x1, x2, x3, x4 = self.rfb1(x1), self.rfb2(x2), self.rfb3(x3), self.rfb4(x4)
+        if x_topo is not None:
+            qt1, qt2, qt3, qt4 = self.topo_encoder(x_topo)
+        else:
+            qt1, qt2, qt3, qt4 = self._zero_topo(q_feats_rgb)
+
+        if s_x_topo is not None:
+            s_feats_topo = self.topo_encoder(
+                s_x_topo.view(-1, self.topo_in_chans, *img_size))
+            st1, st2, st3, st4 = s_feats_topo
+        else:
+            st1, st2, st3, st4 = self._zero_topo(s_feats_rgb)
+
+        q_feats_fuse = [
+            self.fuse1(qr1, qt1),
+            self.fuse2(qr2, qt2),
+            self.fuse3(qr3, qt3),
+            self.fuse4(qr4, qt4),
+        ]
+        s_feats_fuse = [
+            self.fuse1(sr1, st1),
+            self.fuse2(sr2, st2),
+            self.fuse3(sr3, st3),
+            self.fuse4(sr4, st4),
+        ]
+
+        proto = self.prototype(q_feats_fuse, s_feats_fuse, s_y)
+
+        x1, x2, x3, x4 = q_feats_fuse
+        # x1, x2, x3, x4 = self.rfb1(x1), self.rfb2(x2), self.rfb3(x3), self.rfb4(x4)
+
         x = self.up1(x4, x3, proto)
         out1 = F.interpolate(self.side1(x), scale_factor=16, mode='bilinear')
         x = self.up2(x, x2)
@@ -387,5 +265,5 @@ if __name__ == "__main__":
         x = torch.randn(1, 3, 352, 352).cuda()
         s_x = torch.randn(1, 1, 3, 352, 352).cuda()
         s_y = torch.zeros(1, 1, 352, 352).cuda()
-        out, out1, out2 = model(x, s_x, s_y)
+        out, out1, out2 = model(x, None, s_x, None, s_y)
         print(out.shape, out1.shape, out2.shape)
